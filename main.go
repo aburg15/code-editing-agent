@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -13,6 +15,15 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/invopop/jsonschema"
+
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha1"
+	"encoding/base64"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
 )
 
 func main() {
@@ -25,7 +36,7 @@ func main() {
 		}
 		return scanner.Text(), true
 	}
-	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition, GetDateDefinition}
+	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition, GetDateDefinition, PostToTwitterDefinition}
 
 	agent := NewAgent(&client, getUserMessage, tools)
 	err := agent.Run(context.TODO())
@@ -342,4 +353,161 @@ func GetDate(input json.RawMessage) (string, error) {
 	}
 
 	return string(result), nil
+}
+
+// Create Authorization header
+var PostToTwitterDefinition = ToolDefinition{
+	Name:        "post_to_twitter",
+	Description: "Post a tweet to Twitter/X. Use this when the user wants to share content on Twitter. Keep tweets under 280 characters.",
+	InputSchema: PostToTwitterInputSchema,
+	Function:    PostToTwitter,
+}
+
+type PostToTwitterInput struct {
+	Text string `json:"text" jsonschema_description:"The text content of the tweet. Must be 280 characters or less."`
+}
+
+var PostToTwitterInputSchema = GenerateSchema[PostToTwitterInput]()
+
+func PostToTwitter(input json.RawMessage) (string, error) {
+	postInput := PostToTwitterInput{}
+	err := json.Unmarshal(input, &postInput)
+	if err != nil {
+		return "", err
+	}
+
+	if len(postInput.Text) > 280 {
+		return "", fmt.Errorf("tweet text exceeds 280 character limit")
+	}
+
+	// Get environment variables
+	apiKey := os.Getenv("TWITTER_API_KEY")
+	apiSecret := os.Getenv("TWITTER_API_SECRET")
+	accessToken := os.Getenv("TWITTER_ACCESS_TOKEN")
+	accessTokenSecret := os.Getenv("TWITTER_ACCESS_TOKEN_SECRET")
+
+	if apiKey == "" || apiSecret == "" || accessToken == "" || accessTokenSecret == "" {
+		return "", fmt.Errorf("missing Twitter API credentials. Please set TWITTER_API_KEY, TWITTER_API_SECRET, TWITTER_ACCESS_TOKEN, and TWITTER_ACCESS_TOKEN_SECRET environment variables")
+	}
+
+	// Twitter API v2 endpoint for posting tweets
+	apiURL := "https://api.twitter.com/2/tweets"
+
+	// Create JSON payload for v2 API
+	payload := map[string]string{
+		"text": postInput.Text,
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal JSON payload: %v", err)
+	}
+
+	// Create OAuth signature for v2 API
+	oauthParams := map[string]string{
+		"oauth_consumer_key":     apiKey,
+		"oauth_nonce":            generateNonce(),
+		"oauth_signature_method": "HMAC-SHA1",
+		"oauth_timestamp":        strconv.FormatInt(time.Now().Unix(), 10),
+		"oauth_token":            accessToken,
+		"oauth_version":          "1.0",
+	}
+
+	// For v2 API, we don't include the JSON body in the signature
+	// Only the OAuth parameters are used for signature generation
+	emptyParams := url.Values{}
+	signature := createOAuthSignature("POST", apiURL, emptyParams, oauthParams, apiSecret, accessTokenSecret)
+	oauthParams["oauth_signature"] = signature
+
+	authHeader := createAuthHeader(oauthParams) // Twitter tool definition
+
+	// Create the HTTP request with JSON payload
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %v", err)
+	}
+
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("Content-Type", "application/json")
+
+	// Make the request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to post tweet: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	if resp.StatusCode != 201 { // v2 API returns 201 for successful tweet creation
+		return "", fmt.Errorf("Twitter API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return "Tweet posted successfully!", nil
+}
+
+// OAuth helper functions
+func generateNonce() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+func createOAuthSignature(method, apiURL string, params url.Values, oauthParams map[string]string, consumerSecret, tokenSecret string) string {
+	// Combine all parameters
+	allParams := make(map[string]string)
+	for k, v := range oauthParams {
+		allParams[k] = v
+	}
+	for k, v := range params {
+		allParams[k] = v[0]
+	}
+
+	// Sort parameters by key
+	var keys []string
+	for k := range allParams {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Create parameter string with proper encoding
+	var paramPairs []string
+	for _, k := range keys {
+		paramPairs = append(paramPairs, fmt.Sprintf("%s=%s",
+			url.QueryEscape(k),
+			url.QueryEscape(allParams[k])))
+	}
+	paramString := strings.Join(paramPairs, "&")
+
+	// Create signature base string
+	baseString := fmt.Sprintf("%s&%s&%s",
+		strings.ToUpper(method),
+		url.QueryEscape(apiURL),
+		url.QueryEscape(paramString))
+
+	// Create signing key
+	signingKey := fmt.Sprintf("%s&%s",
+		url.QueryEscape(consumerSecret),
+		url.QueryEscape(tokenSecret))
+
+	// Create signature
+	h := hmac.New(sha1.New, []byte(signingKey))
+	h.Write([]byte(baseString))
+	signature := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	return signature
+}
+
+func createAuthHeader(oauthParams map[string]string) string {
+	var pairs []string
+	for k, v := range oauthParams {
+		pairs = append(pairs, fmt.Sprintf(`%s="%s"`, k, url.QueryEscape(v)))
+	}
+	sort.Strings(pairs) // Ensure consistent ordering
+	return "OAuth " + strings.Join(pairs, ", ")
 }
